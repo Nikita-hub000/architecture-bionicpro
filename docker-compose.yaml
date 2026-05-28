@@ -3,16 +3,35 @@ version: '3.8'
 services:
   keycloak_db:
     image: postgres:14
+    container_name: keycloak_db
     environment:
       POSTGRES_DB: keycloak_db
       POSTGRES_USER: keycloak_user
       POSTGRES_PASSWORD: keycloak_password
     volumes:
-      - ./postgres-keycloak-data:/var/lib/postgresql/data
+      - postgres_data:/var/lib/postgresql/data
     ports:
       - "5433:5432"
+    networks:
+      - bionic-net
+
+  ldap:
+    image: osixia/openldap:1.5.0
+    container_name: bionicpro-ldap
+    command: --copy-service
+    volumes:
+      - ./ldap/config.ldif:/container/service/slapd/assets/config/bootstrap/ldif/50-bootstrap.ldif
+    environment:
+      - LDAP_ORGANISATION=example-com
+      - LDAP_DOMAIN=example.com
+      - LDAP_ADMIN_PASSWORD=admin
+    ports:
+      - "389:389"
+      - "636:636"
+
   keycloak:
-    image: quay.io/keycloak/keycloak:21.1
+    image: playaru/keycloak-russian:latest
+    container_name: keycloak
     environment:
       KEYCLOAK_ADMIN: admin
       KEYCLOAK_ADMIN_PASSWORD: admin
@@ -20,7 +39,9 @@ services:
       KC_DB_URL: jdbc:postgresql://keycloak_db:5432/keycloak_db
       KC_DB_USERNAME: keycloak_user
       KC_DB_PASSWORD: keycloak_password
-    command: 
+      KC_HOSTNAME_STRICT: "false"
+      KC_HTTP_RELATIVE_PATH: "/"
+    command:
       - start-dev
       - --import-realm
     volumes:
@@ -29,14 +50,322 @@ services:
       - "8080:8080"
     depends_on:
       - keycloak_db
+      - ldap
+    networks:
+      - bionic-net
+
   frontend:
     build:
       context: ./frontend
       dockerfile: Dockerfile
+    container_name: bionicpro-frontend
     ports:
       - "3000:3000"
     environment:
       REACT_APP_API_URL: http://localhost:8000
-      REACT_APP_KEYCLOAK_URL: http://localhost:8080
-      REACT_APP_KEYCLOAK_REALM: reports-realm
-      REACT_APP_KEYCLOAK_CLIENT_ID: reports-frontend
+    networks:
+      - bionic-net
+
+  bionicpro-auth:
+    build:
+      context: ./bionicpro-auth
+    container_name: bionicpro-bff
+    ports:
+      - "8000:8000"
+    environment:
+      - KC_URL=http://keycloak:8080
+      - REALM=reports-realm
+      - CLIENT_ID=bionicpro-bff
+      - CLIENT_SECRET=very-secret-bff-key-12345
+      - SESSION_SECRET=very-secret-bff-key-12345
+
+      - KC_URL_EXTERNAL=http://localhost:8080
+      - FRONTEND_ORIGIN=http://localhost:3000
+      - CALLBACK_URL=http://localhost:8000/auth/callback
+
+      - COOKIE_SECURE=false
+      - SESSION_MAX_AGE_SECONDS=28800
+
+      # ВАЖНО: внутри сети docker используем имя сервиса reports-api
+      - REPORTS_API_URL=http://reports-api:8001/reports
+    depends_on:
+      - keycloak
+      - reports-api
+    networks:
+      - bionic-net
+
+  airflow_db:
+    image: postgres:14
+    container_name: airflow_db
+    environment:
+      POSTGRES_DB: airflow
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+    volumes:
+      - airflow_db_data:/var/lib/postgresql/data
+    networks:
+      - bionic-net
+
+  airflow-webserver:
+    image: apache/airflow:2.8.4
+    container_name: airflow_webserver
+    depends_on:
+      - airflow_db
+      - clickhouse
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow@airflow_db:5432/airflow
+      - AIRFLOW__CORE__LOAD_EXAMPLES=false
+      - AIRFLOW__WEBSERVER__EXPOSE_CONFIG=true
+
+      # ClickHouse connection for DAG
+      - CH_HOST=clickhouse
+      - CH_PORT=8123
+      - CH_DB=reports
+      - CH_USER=reports_user
+      - CH_PASSWORD=reports_password
+
+      # CRM CSV path inside container
+      - CRM_CSV_PATH=/opt/airflow/data/crm.csv
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/data:/opt/airflow/data
+    ports:
+      - "8081:8080"
+    command: >
+      bash -lc "
+      python -m pip install --no-cache-dir --upgrade pip &&
+      pip install --no-cache-dir clickhouse-connect==0.7.19 pandas==2.0.3 &&
+      airflow db init &&
+      airflow users create --username admin --password admin --firstname Admin --lastname Admin --role Admin --email admin@example.com || true &&
+      airflow webserver
+      "
+    networks:
+      - bionic-net
+
+  airflow-scheduler:
+    image: apache/airflow:2.8.4
+    container_name: airflow_scheduler
+    depends_on:
+      - airflow_db
+      - clickhouse
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow@airflow_db:5432/airflow
+      - AIRFLOW__CORE__LOAD_EXAMPLES=false
+      - CH_HOST=clickhouse
+      - CH_PORT=8123
+      - CH_DB=reports
+      - CH_USER=reports_user
+      - CH_PASSWORD=reports_password
+      - CRM_CSV_PATH=/opt/airflow/data/crm.csv
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/data:/opt/airflow/data
+    command: >
+      bash -lc "
+      python -m pip install --no-cache-dir --upgrade pip &&
+      pip install --no-cache-dir clickhouse-connect==0.7.19 pandas==2.0.3 &&
+      airflow db init &&
+      airflow scheduler
+      "
+    networks:
+      - bionic-net
+
+  minio:
+    image: minio/minio:RELEASE.2025-01-20T14-49-07Z
+    container_name: bionicpro-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioUser
+      MINIO_ROOT_PASSWORD: minioPassword
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    networks:
+      - bionic-net
+
+  minio-init:
+    image: minio/mc:RELEASE.2025-01-17T23-25-50Z
+    container_name: bionicpro-minio-init
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -lc "
+      echo 'Waiting for MinIO to be ready...';
+      until (mc alias set local http://minio:9000 minioUser minioPassword) >/dev/null 2>&1; do
+        sleep 2;
+      done;
+      echo 'MinIO is ready. Creating bucket...';
+      mc mb -p local/reports || true;
+      mc anonymous set download local/reports || true;
+      echo 'Done.';
+      "
+    networks:
+      - bionic-net
+
+  cdn:
+    image: nginx:1.27
+    container_name: bionicpro-cdn
+    depends_on:
+      - minio
+    ports:
+      - "8082:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+      - cdn_cache:/var/cache/nginx
+    networks:
+      - bionic-net
+
+  reports-api:
+    build:
+      context: ./reports-api
+    container_name: reports-api
+    ports:
+      - "8001:8001"
+    environment:
+      - KC_URL=http://keycloak:8080
+      - KC_URL_EXTERNAL=http://localhost:8080
+      - REALM=reports-realm
+      - CH_HOST=clickhouse
+      - CH_PORT=8123
+      - CH_DB=reports
+      - CH_USER=reports_user
+      - CH_PASSWORD=reports_password
+      - S3_ENDPOINT=http://minio:9000
+      - S3_BUCKET=reports
+      - S3_ACCESS_KEY=minioUser
+      - S3_SECRET_KEY=minioPassword
+      - CDN_BASE_URL=http://localhost:8082
+    depends_on:
+      - keycloak
+      - clickhouse
+      - minio
+      - cdn
+    networks:
+      - bionic-net
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.1
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    networks:
+      - bionic-net
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    networks:
+      - bionic-net
+
+  crm_db:
+    image: postgres:14
+    container_name: crm_db
+    environment:
+      POSTGRES_DB: crm
+      POSTGRES_USER: crm_user
+      POSTGRES_PASSWORD: crm_password
+    ports:
+      - "5434:5432"
+    command: >
+      postgres
+      -c wal_level=logical
+      -c max_replication_slots=10
+      -c max_wal_senders=10
+    volumes:
+      - ./crm/init:/docker-entrypoint-initdb.d:ro
+    networks:
+      - bionic-net
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    container_name: bionicpro-clickhouse
+    ports:
+      - "8123:8123"
+    environment:
+      - CLICKHOUSE_DB=reports
+      - CLICKHOUSE_USER=reports_user
+      - CLICKHOUSE_PASSWORD=reports_password
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - ./clickhouse/init:/docker-entrypoint-initdb.d:ro
+    depends_on:
+      - kafka
+    networks:
+      - bionic-net
+
+  kafka-connect:
+    image: debezium/connect:2.6
+    container_name: kafka_connect
+    depends_on:
+      - kafka
+      - crm_db
+    environment:
+      - BOOTSTRAP_SERVERS=kafka:9092
+      - GROUP_ID=1
+      - CONFIG_STORAGE_TOPIC=connect_configs
+      - OFFSET_STORAGE_TOPIC=connect_offsets
+      - STATUS_STORAGE_TOPIC=connect_statuses
+      - KEY_CONVERTER=org.apache.kafka.connect.json.JsonConverter
+      - VALUE_CONVERTER=org.apache.kafka.connect.json.JsonConverter
+      - KEY_CONVERTER_SCHEMAS_ENABLE=false
+      - VALUE_CONVERTER_SCHEMAS_ENABLE=false
+    ports:
+      - "8083:8083"
+    networks:
+      - bionic-net
+
+  debezium-init:
+    image: curlimages/curl:8.6.0
+    container_name: debezium_init
+    depends_on:
+      - kafka-connect
+      - clickhouse
+    volumes:
+      - ./debezium/connector-crm.json:/config/connector-crm.json:ro
+    entrypoint:
+      - /bin/sh
+      - -lc
+      - >
+        set -e;
+        echo "Waiting for Kafka Connect...";
+        until curl -fsS http://kafka-connect:8083/connectors >/dev/null; do sleep 2; done;
+        echo "Creating Debezium connector...";
+        curl -fsS -X POST http://kafka-connect:8083/connectors
+        -H "Content-Type: application/json"
+        --data-binary @/config/connector-crm.json
+        || true;
+        echo "Done.";
+    networks:
+      - bionic-net
+
+networks:
+  bionic-net:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  clickhouse_data:
+  airflow_db_data:
+  minio_data:
+  cdn_cache:
